@@ -27,7 +27,6 @@ W, H = 1080, 1920
 FONT_BLACK = "/usr/share/fonts/opentype/inter/Inter-Black.otf"
 FONT_BOLD = "/usr/share/fonts/opentype/inter/Inter-Bold.otf"
 FONT_REG = "/usr/share/fonts/opentype/inter/Inter-Medium.otf"
-SAMPLE_GAP = 0.18  # silence between sentences, seconds
 
 
 def run(cmd):
@@ -75,26 +74,66 @@ def narrator_gender(story):
     return "female"
 
 
+# Reddit shorthand, spoken out loud. Applied to the narration (and so the captions);
+# the title card keeps the original text.
+SPOKEN = {
+    "AITA": "Am I the asshole", "WIBTA": "Would I be the asshole", "AITAH": "Am I the asshole",
+    "TIFU": "Today I fucked up", "YTA": "You're the asshole", "NTA": "Not the asshole",
+    "ESH": "Everyone sucks here", "NAH": "No assholes here", "TL;DR": "Too long, didn't read",
+    "TLDR": "Too long, didn't read", "MIL": "mother-in-law", "FIL": "father-in-law",
+    "SIL": "sister-in-law", "BIL": "brother-in-law", "BF": "boyfriend", "GF": "girlfriend",
+    "DH": "husband", "DW": "wife", "OP": "O P", "IMO": "in my opinion", "TBH": "to be honest",
+}
+PAUSE_SENTENCE = 0.32  # after . ! ?
+PAUSE_PARAGRAPH = 0.65  # between paragraphs
+PAUSE_TITLE = 0.9  # between the title and the story
+
+
+def spoken(text):
+    for short, full in SPOKEN.items():
+        text = re.sub(rf"(?<![\w']){re.escape(short)}(?![\w'])", full, text)
+    # ages/genders like (26F) or 32M -> "26, female"
+    text = re.sub(r"\(?\b(\d{2})\s?([MF])\b\)?",
+                  lambda m: f"{m[1]}, {'male' if m[2].upper() == 'M' else 'female'},", text)
+    return re.sub(r",\s*,", ",", text)
+
+
+def make_phonemizer():
+    """misaki is the G2P Kokoro was trained with: dictionary-based, so words like
+    lawyer / volleyball / house come out right, and punctuation is kept for natural pauses."""
+    import espeakng_loader
+    from phonemizer.backend.espeak.wrapper import EspeakWrapper
+
+    EspeakWrapper.set_library(espeakng_loader.get_library_path())
+    EspeakWrapper.set_data_path(espeakng_loader.get_data_path())
+    from misaki import en, espeak
+
+    g2p = en.G2P(trf=False, british=False, fallback=espeak.EspeakFallback(british=False))
+    return lambda text: g2p(text)[0]
+
+
 def narrate(story, model_dir, voice_name, work, speed):
     import numpy as np
     from kokoro_onnx import Kokoro
 
     model_dir = Path(model_dir)
     tts = Kokoro(str(model_dir / "kokoro-v1.0.onnx"), str(model_dir / "voices-v1.0.bin"))
+    phonemize = make_phonemizer()
 
-    sentences = [("title", s) for s in split_sentences(story["title"])]
+    sentences = []  # (kind, text, pause after)
+    for s in split_sentences(spoken(story["title"])):
+        sentences.append(["title", s, PAUSE_SENTENCE])
+    sentences[-1][2] = PAUSE_TITLE
     for para in story["body"]:
-        sentences += [("body", s) for s in split_sentences(para)]
+        for s in split_sentences(spoken(para)):
+            sentences.append(["body", s, PAUSE_SENTENCE])
+        sentences[-1][2] = PAUSE_PARAGRAPH
 
     chunks, timeline, t, rate = [], [], 0.0, 24000
-    for i, (kind, text) in enumerate(sentences):
-        audio, rate = tts.create(text, voice=voice_name, speed=speed, lang="en-us")
+    for kind, text, pause in sentences:
+        audio, rate = tts.create(phonemize(text), voice=voice_name, speed=speed, is_phonemes=True)
         dur = len(audio) / rate
         timeline.append((kind, text, t, t + dur))
-        pause = SAMPLE_GAP
-        # a longer pause after the title, before the story starts
-        if kind == "title" and (i + 1 == len(sentences) or sentences[i + 1][0] != "title"):
-            pause *= 4
         chunks += [audio, np.zeros(int(rate * pause), dtype=np.float32)]
         t += dur + pause
 
@@ -114,7 +153,7 @@ def word_timings(timeline):
     words = []
     for kind, text, start, end in timeline:
         toks = text.split()
-        weights = [len(re.sub(r"\W", "", t)) + 2 for t in toks]
+        weights = [len(re.sub(r"\W", "", t)) + 2 + (3 if re.search(r"[,;:]$", t) else 0) for t in toks]
         total = sum(weights)
         t = start
         for tok, w in zip(toks, weights):
@@ -251,7 +290,7 @@ def main():
     ap.add_argument("--placeholder", action="store_true", help="use a generated background")
     ap.add_argument("--kokoro-dir", default="models", help="folder with kokoro-v1.0.onnx + voices-v1.0.bin")
     ap.add_argument("--voice", help="force a Kokoro voice, e.g. af_bella or am_fenrir")
-    ap.add_argument("--speed", type=float, default=1.1, help="narration speed (1.0 = normal)")
+    ap.add_argument("--speed", type=float, default=1.05, help="narration speed (1.0 = normal)")
     ap.add_argument("--work", default="build")
     ap.add_argument("--out", default="output/reddit_story.mp4")
     ap.add_argument("--seed", type=int, default=7)
