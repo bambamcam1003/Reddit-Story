@@ -2,14 +2,15 @@
 """Build a vertical (1080x1920) Reddit-story video for TikTok.
 
 Pipeline:
-  1. Narrate the title + body with Piper TTS (offline), sentence by sentence.
+  1. Narrate the title + body with Kokoro TTS (offline), sentence by sentence, using a
+     male or female voice to match the story's narrator.
   2. Estimate per-word timings and write big, centered, pop-in captions (ASS).
   3. Draw a Reddit-style title card shown while the title is read.
   4. Cut the gameplay footage into segments from across the source, crop to 9:16,
      mute it, and lay the narration + captions on top.
 
 Usage:
-  python3 make_video.py --background parkour.mp4 --voice en_US-ryan-high.onnx
+  python3 make_video.py --background parkour.mp4 --kokoro-dir models/
   python3 make_video.py --placeholder ...      # preview without gameplay footage
 """
 import argparse
@@ -46,41 +47,64 @@ def split_sentences(text):
 
 
 # ---------------------------------------------------------------- narration
-def narrate(story, voice_path, work, length_scale):
-    from piper import PiperVoice, SynthesisConfig
+VOICES = {"female": "af_heart", "male": "am_michael"}  # best-rated Kokoro voices
 
-    voice = PiperVoice.load(str(voice_path))
-    cfg = SynthesisConfig(length_scale=length_scale)
-    rate = voice.config.sample_rate
+GENDER_PATTERNS = [
+    (r"\(\s*\d{2}\s*([MF])\s*\)|\[\s*\d{2}\s*([MF])\s*\]|\b\d{2}\s?([MF])\b", None),
+    (r"\b\d{2}\s*,?\s*(male|female)\b|\bI'?m\s+(?:a\s+)?[\w -]{0,20}?,?\s*(male|female)\b", None),
+    (r"\bI'?m\s+(?:a|an)\s+(?:\w+\s+)?(guy|man|dude|husband|boyfriend|dad|father|son|brother)\b", "male"),
+    (r"\bI'?m\s+(?:a|an)\s+(?:\w+\s+)?(girl|woman|lady|wife|girlfriend|mom|mother|daughter|sister)\b", "female"),
+    (r"\bmy (wife|girlfriend)\b", "male"),
+    (r"\bmy (husband|boyfriend)\b", "female"),
+]
+
+
+def narrator_gender(story):
+    """Explicit "narrator" field wins; otherwise look for clues like (26F), "26 female", "I'm a guy"."""
+    if story.get("narrator") in VOICES:
+        return story["narrator"]
+    text = " ".join([story["title"], *story["body"]])
+    for pattern, gender in GENDER_PATTERNS:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            if gender:
+                return gender
+            g = next(x for x in m.groups() if x).lower()
+            return "male" if g in ("m", "male") else "female"
+    print("warning: couldn't tell the narrator's gender; defaulting to female (set \"narrator\" in the story)")
+    return "female"
+
+
+def narrate(story, model_dir, voice_name, work, speed):
+    import numpy as np
+    from kokoro_onnx import Kokoro
+
+    model_dir = Path(model_dir)
+    tts = Kokoro(str(model_dir / "kokoro-v1.0.onnx"), str(model_dir / "voices-v1.0.bin"))
 
     sentences = [("title", s) for s in split_sentences(story["title"])]
     for para in story["body"]:
         sentences += [("body", s) for s in split_sentences(para)]
 
-    pcm = bytearray()
-    timeline = []  # (kind, text, start, end)
-    gap = b"\x00\x00" * int(rate * SAMPLE_GAP)
+    chunks, timeline, t, rate = [], [], 0.0, 24000
     for i, (kind, text) in enumerate(sentences):
-        tmp = work / f"s{i:03d}.wav"
-        with wave.open(str(tmp), "wb") as wf:
-            voice.synthesize_wav(text, wf, syn_config=cfg)
-        with wave.open(str(tmp), "rb") as rf:
-            frames = rf.readframes(rf.getnframes())
-        start = len(pcm) / 2 / rate
-        pcm += frames
-        timeline.append((kind, text, start, len(pcm) / 2 / rate))
-        pcm += gap
+        audio, rate = tts.create(text, voice=voice_name, speed=speed, lang="en-us")
+        dur = len(audio) / rate
+        timeline.append((kind, text, t, t + dur))
+        pause = SAMPLE_GAP
         # a longer pause after the title, before the story starts
         if kind == "title" and (i + 1 == len(sentences) or sentences[i + 1][0] != "title"):
-            pcm += gap * 3
-        tmp.unlink()
+            pause *= 4
+        chunks += [audio, np.zeros(int(rate * pause), dtype=np.float32)]
+        t += dur + pause
 
+    pcm = (np.clip(np.concatenate(chunks), -1, 1) * 32767).astype("<i2")
     out = work / "narration.wav"
     with wave.open(str(out), "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(rate)
-        wf.writeframes(bytes(pcm))
+        wf.writeframes(pcm.tobytes())
     return out, timeline
 
 
@@ -225,8 +249,9 @@ def main():
     ap.add_argument("--story", default="story/story.json")
     ap.add_argument("--background", nargs="*", default=[], help="gameplay video file(s)")
     ap.add_argument("--placeholder", action="store_true", help="use a generated background")
-    ap.add_argument("--voice", required=True, help="Piper .onnx voice model")
-    ap.add_argument("--speed", type=float, default=1.0, help="Piper length_scale (lower = faster)")
+    ap.add_argument("--kokoro-dir", default="models", help="folder with kokoro-v1.0.onnx + voices-v1.0.bin")
+    ap.add_argument("--voice", help="force a Kokoro voice, e.g. af_bella or am_fenrir")
+    ap.add_argument("--speed", type=float, default=1.1, help="narration speed (1.0 = normal)")
     ap.add_argument("--work", default="build")
     ap.add_argument("--out", default="output/reddit_story.mp4")
     ap.add_argument("--seed", type=int, default=7)
@@ -240,7 +265,10 @@ def main():
     work.mkdir(parents=True, exist_ok=True)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
 
-    audio, timeline = narrate(story, args.voice, work, args.speed)
+    gender = narrator_gender(story)
+    voice = args.voice or VOICES[gender]
+    print(f"narrator: {gender} -> voice {voice}")
+    audio, timeline = narrate(story, args.kokoro_dir, voice, work, args.speed)
     duration = probe_duration(audio)
     title_end = max(e for k, _, _, e in timeline if k == "title") + 0.4
     print(f"narration: {duration:.1f}s (title card until {title_end:.1f}s)")

@@ -1,7 +1,8 @@
 build/
+models/
 output/
 *.onnx
-*.onnx.json
+*.bin
 *.mp4
 *.webm
 *.wav
