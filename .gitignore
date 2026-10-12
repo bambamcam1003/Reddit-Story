@@ -1,0 +1,8 @@
+build/
+output/
+*.onnx
+*.onnx.json
+*.mp4
+*.webm
+*.wav
+__pycache__/
